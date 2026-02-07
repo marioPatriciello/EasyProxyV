@@ -2,6 +2,7 @@ import logging
 import sys
 import os
 import asyncio
+import base64
 from aiohttp import web
 
 # Aggiungi path corrente per import moduli
@@ -16,7 +17,7 @@ if DVR_ENABLED:
     from services.recording_manager import RecordingManager
     from routes.recordings import setup_recording_routes
 
-# Configurazione logging (già configurata in config.py ma utile per il main)
+# Configurazione logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
@@ -25,19 +26,40 @@ logging.basicConfig(
 # --- Logica di Avvio ---
 def create_app():
     """Crea e configura l'applicazione aiohttp."""
-    # Start proxy and ffmpeg manager
+
     ffmpeg_manager = FFmpegManager()
-
-    # Clean up any leftover processes on start
-    # asyncio.create_task(ffmpeg_manager.cleanup_loop()) # Should be started in on_startup
-
     proxy = HLSProxy(ffmpeg_manager=ffmpeg_manager)
 
     app = web.Application()
-    app['ffmpeg_manager'] = ffmpeg_manager # Make accessible for routes
-    app.ffmpeg_manager = ffmpeg_manager # Hack for access in route handler above function
+    app['ffmpeg_manager'] = ffmpeg_manager
+    app.ffmpeg_manager = ffmpeg_manager
 
-    # Initialize recording manager for DVR functionality (only if enabled)
+    # --- Middleware per autenticazione Basic via variabile d'ambiente ---
+    PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
+    if not PROXY_PASSWORD:
+        raise Exception("Devi impostare la variabile d'ambiente PROXY_PASSWORD!")
+
+    @web.middleware
+    async def auth_middleware(request, handler):
+        auth = request.headers.get("Authorization")
+        if not auth or not auth.startswith("Basic "):
+            return web.Response(
+                status=401,
+                headers={"WWW-Authenticate": 'Basic realm="Proxy"'},
+                text="Autenticazione richiesta"
+            )
+        encoded = auth.split(" ")[1]
+        try:
+            decoded = base64.b64decode(encoded).decode()
+        except Exception:
+            return web.Response(status=400, text="Header Authorization non valido")
+        if decoded != f"user:{PROXY_PASSWORD}":
+            return web.Response(status=403, text="Password errata")
+        return await handler(request)
+
+    app.middlewares.append(auth_middleware)
+
+    # --- Recording Manager se DVR abilitato ---
     if DVR_ENABLED:
         recording_manager = RecordingManager(
             recordings_dir=RECORDINGS_DIR,
@@ -45,17 +67,16 @@ def create_app():
             retention_days=RECORDINGS_RETENTION_DAYS
         )
         app['recording_manager'] = recording_manager
-    
-    # Registra le route
+
+    # --- Registrazione route del proxy ---
     app.router.add_get('/', proxy.handle_root)
-    app.router.add_get('/favicon.ico', proxy.handle_favicon) # ✅ Route Favicon
+    app.router.add_get('/favicon.ico', proxy.handle_favicon)
     
-    # ✅ Route Static Files (con path assoluto e creazione automatica)
     static_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
     if not os.path.exists(static_path):
         os.makedirs(static_path)
     app.router.add_static('/static', static_path)
-    
+
     app.router.add_get('/builder', proxy.handle_builder)
     app.router.add_get('/info', proxy.handle_info_page)
     app.router.add_get('/api/info', proxy.handle_api_info)
@@ -63,124 +84,34 @@ def create_app():
     app.router.add_get('/proxy/manifest.m3u8', proxy.handle_proxy_request)
     app.router.add_get('/proxy/hls/manifest.m3u8', proxy.handle_proxy_request)
     app.router.add_get('/proxy/mpd/manifest.m3u8', proxy.handle_proxy_request)
-    # ✅ NUOVO: Endpoint generico per stream (compatibilità MFP)
     app.router.add_get('/proxy/stream', proxy.handle_proxy_request)
     app.router.add_get('/extractor', proxy.handle_extractor_request)
-    # ✅ NUOVO: Endpoint compatibilità MFP per estrazione
     app.router.add_get('/extractor/video', proxy.handle_extractor_request)
-    
-    # ✅ NUOVO: Route per segmenti con estensioni corrette per compatibilità player
     app.router.add_get('/proxy/hls/segment.ts', proxy.handle_proxy_request)
     app.router.add_get('/proxy/hls/segment.m4s', proxy.handle_proxy_request)
     app.router.add_get('/proxy/hls/segment.mp4', proxy.handle_proxy_request)
-    
     app.router.add_get('/playlist', proxy.handle_playlist_request)
     app.router.add_get('/segment/{segment}', proxy.handle_ts_segment)
-    app.router.add_get('/decrypt/segment.mp4', proxy.handle_decrypt_segment)  # ClearKey decryption for legacy mode
-    app.router.add_get('/decrypt/segment.ts', proxy.handle_decrypt_segment)   # TS variant for legacy mode
-    
-    # ✅ NUOVO: Route per licenze DRM (GET e POST)
+    app.router.add_get('/decrypt/segment.mp4', proxy.handle_decrypt_segment)
+    app.router.add_get('/decrypt/segment.ts', proxy.handle_decrypt_segment)
     app.router.add_get('/license', proxy.handle_license_request)
     app.router.add_post('/license', proxy.handle_license_request)
-    
-    # ✅ NUOVO: Endpoint per generazione URL (compatibilità MFP)
     app.router.add_post('/generate_urls', proxy.handle_generate_urls)
-
-    # --- PROXY ROUTES GENERICI ---
-    async def proxy_hls_stream(request):
-        """Serve segments generated by FFmpeg"""
-        stream_id = request.match_info['stream_id']
-        filename = request.match_info['filename']
-        
-        file_path = os.path.join("temp_hls", stream_id, filename)
-        
-        # Security check: ensure path is within temp_hls
-        try:
-            if not os.path.abspath(file_path).startswith(os.path.abspath("temp_hls")):
-                 return web.Response(status=403, text="Access denied")
-        except:
-            return web.Response(status=403, text="Access denied")
-
-        if not os.path.exists(file_path):
-            return web.Response(status=404, text="Segment not found")
-            
-        # Notify manager to keep stream alive
-        if hasattr(app, 'ffmpeg_manager'):
-             app.ffmpeg_manager.touch_stream(stream_id)
-        
-        if not os.path.exists(file_path):
-            return web.Response(status=404, text="Segment not found")
-            
-        # Notify manager to keep stream alive
-        if hasattr(app, 'ffmpeg_manager'):
-             app.ffmpeg_manager.touch_stream(stream_id)
-        
-        headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Connection": "keep-alive"
-        }
-
-        # Special handling for m3u8: read content and return 200 OK (no Range)
-        if filename.endswith('.m3u8'):
-            try:
-                # Add a small delay/retry read loop if file is being written?
-                # Usually OS allows reading while writing, but empty file is possible.
-                content = ""
-                for _ in range(3):
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    if content:
-                        break
-                    await asyncio.sleep(0.05)
-                
-                return web.Response(
-                    text=content,
-                    content_type='application/vnd.apple.mpegurl',
-                    headers=headers
-                )
-            except Exception as e:
-                logging.error(f"Error reading playlist {file_path}: {e}")
-                return web.Response(status=500, text="Internal Server Error")
-        
-        elif filename.endswith('.ts'):
-            # For segments, correct mime type
-            # We can still use FileResponse for efficiency, usually players handle range or 206 for segments fine.
-            # But let's force expected headers.
-            # aiohttp FileResponse handles ranges automatically. 
-            pass
-            
-        # web.FileResponse doesn't easily allow overriding headers in constructor in older versions,
-        # but we can set them on the response object if we create it differently or subclass.
-        # Actually, standard FileResponse takes headers.
-        
-        # Explicit content type for TS
-        if filename.endswith('.ts'):
-             # Create response, add headers, then prepare? No, FileResponse is unexpected.
-             # Just pass headers.
-             headers['Content-Type'] = 'video/MP2T'
-             return web.FileResponse(file_path, headers=headers)
-        
-        return web.FileResponse(file_path, headers=headers)
-
-    app.router.add_get('/ffmpeg_stream/{stream_id}/{filename}', proxy_hls_stream)
-
-    # ✅ NUOVO: Endpoint per ottenere l'IP pubblico
+    app.router.add_get('/ffmpeg_stream/{stream_id}/{filename}', proxy.handle_proxy_request)
     app.router.add_get('/proxy/ip', proxy.handle_proxy_ip)
 
-    # Setup recording/DVR routes (only if enabled)
+    # --- Setup DVR routes se abilitato ---
     if DVR_ENABLED:
         setup_recording_routes(app, recording_manager)
-    
-    # Gestore OPTIONS generico per CORS
+
+    # --- CORS generico ---
     app.router.add_route('OPTIONS', '/{tail:.*}', proxy.handle_options)
-    
+
+    # --- Cleanup / startup / shutdown ---
     async def cleanup_handler(app):
         await proxy.cleanup()
     app.on_cleanup.append(cleanup_handler)
-    
+
     async def on_startup(app):
         asyncio.create_task(ffmpeg_manager.cleanup_loop())
         if DVR_ENABLED:
@@ -191,36 +122,22 @@ def create_app():
         if DVR_ENABLED:
             await recording_manager.shutdown()
     app.on_shutdown.append(on_shutdown)
-    
+
     return app
 
-# Crea l'istanza "privata" dell'applicazione aiohttp.
+# Crea l'istanza dell'app
 app = create_app()
 
 def main():
-    """Funzione principale per avviare il server."""
-    # Workaround per il bug di asyncio su Windows con ConnectionResetError
     if sys.platform == 'win32':
-        # Silenzia il logger di asyncio per evitare spam di ConnectionResetError
         logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 
     print("🚀 Starting HLS Proxy Server...")
     print(f"📡 Server available at: http://localhost:{PORT}")
     print(f"📡 Or: http://server-ip:{PORT}")
-    print("🔗 Endpoints:")
-    print("   • / - Main page")
-    print("   • /builder - Web interface for playlist builder")
-    print("   • /info - Server information page")
-    print("   • /recordings - DVR/Recording interface")
-    print("   • /proxy/manifest.m3u8?url=<URL> - Main stream proxy")
-    print("   • /playlist?url=<definitions> - Playlist generator")
-    print("=" * 50)
+    print("🔗 Endpoints principali: /, /builder, /info, /proxy/manifest.m3u8, /playlist, ecc.")
     
-    web.run_app(
-        app, # Usa l'istanza aiohttp originale per il runner integrato
-        host='0.0.0.0',
-        port=PORT
-    )
+    web.run_app(app, host='0.0.0.0', port=PORT)
 
 if __name__ == '__main__':
     main()
